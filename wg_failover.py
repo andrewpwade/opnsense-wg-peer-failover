@@ -70,23 +70,42 @@ import requests
 import urllib3
 
 log = logging.getLogger("wg-failover")
-HTTP_TRACE = 5  # custom level, enabled by -vv
+
+# Custom log level, enabled by -vv.
+HTTP_TRACE = 5
 
 # What we probe.
-TUNNEL_DNS = "10.64.0.1"  # resolver reachable through every peer
-DIRECT_DNS = ("1.1.1.1", "9.9.9.9")  # via WAN: tells "peer down" from "WAN down"
-PROBE_DOMAIN = "example.com"  # we query <random>.example.com (expect NXDOMAIN/NOERROR)
+# Resolver reachable through every peer.
+TUNNEL_DNS = "10.64.0.1"
+# Via WAN: tells "peer down" from "WAN down".
+DIRECT_DNS = ("1.1.1.1", "9.9.9.9")
+# We query <random>.example.com (expect NXDOMAIN/NOERROR).
+PROBE_DOMAIN = "example.com"
+DNS_NOERROR = 0
+DNS_NXDOMAIN = 3
 
 # Timing, in seconds.
-PROBE_INTERVAL = 10  # time between probes
-PROBE_TIMEOUT = 2  # a probe with no answer by now counts as failed
-FAIL_AFTER = 15  # no successful probe for this long => peer is dead
-MIN_FAILURES = 3  # ...and at least this many failed probes in a row
-STABLE_AFTER = 120  # healthy this long => forget previous failovers (reset backoff)
-MAX_HOLD = 600  # longest pause between failovers when everything is failing
-RECENT_FAILURE = 600  # avoid peers that failed within this window if others exist
-SYNC_EVERY = 30  # how often to re-check that exactly one peer is enabled
-API_TIMEOUT = 30  # reconfigure / unbound restart can take a few seconds
+# Time between probes.
+PROBE_INTERVAL = 10
+# A probe with no answer by now counts as failed.
+PROBE_TIMEOUT = 2
+# No successful probe for this long => peer is dead.
+FAIL_AFTER = 15
+# ...and at least this many failed probes in a row.
+MIN_FAILURES = 3
+# Healthy this long => forget previous failovers (reset backoff).
+STABLE_AFTER = 120
+# Longest pause between failovers when everything is failing.
+MAX_HOLD = 600
+# Avoid peers that failed within this window if others exist.
+RECENT_FAILURE = 600
+# How often to re-check that exactly one peer is enabled.
+SYNC_EVERY = 30
+# Reconfigure / unbound restart can take a few seconds.
+API_TIMEOUT = 30
+
+# Sort key for peers that have never completed a handshake.
+NEVER = 1e9
 
 
 @dataclass(frozen=True)
@@ -101,15 +120,26 @@ class Peer:
         return self.name.split("-", 1)[0]
 
 
+@dataclass(frozen=True)
+class Config:
+    key: str
+    secret: str
+    instance: str
+    interface: str
+    url: str = "https://127.0.0.1"
+
+
 class Api:
     """Minimal OPNsense API client. Calls that change things honour dry-run."""
 
     def __init__(self, url, key, secret, dry_run):
         self.url = url.rstrip("/")
         self.dry_run = dry_run
+
         self.http = requests.Session()
         self.http.auth = (key, secret)
-        self.http.verify = False  # loopback to the GUI's self-signed certificate
+        # Loopback to the GUI's self-signed certificate.
+        self.http.verify = False
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     def get(self, path):
@@ -124,49 +154,80 @@ class Api:
         if self.dry_run:
             log.info("[dry-run] would POST %s", path)
             return None
+
         return self._send("POST", path)
 
     def _send(self, method, path, data=None):
         log.debug("%s %s data=%s", method, path, data)
+
         response = self.http.request(
             method, self.url + path, data=data, timeout=API_TIMEOUT
         )
+
         # At -vv this shows what OPNsense really said, e.g. the reason for a 500.
         log.log(HTTP_TRACE, "HTTP %s: %s", response.status_code, response.text[:2000])
+
         if not response.ok:
             body = response.text.strip()[:300] or "empty body"
             raise RuntimeError(f"{method} {path} -> {response.status_code}: {body}")
+
         return response.json()
 
 
-def dns_probe(server):
-    """Resolve a random, uncached name via `server`.
+class DnsClient:
+    """Minimal UDP DNS client, just enough to tell if a resolver is working."""
 
-    True if it answers NOERROR or NXDOMAIN with the matching transaction id.
-    Timeouts, SERVFAIL and REFUSED all count as failure.
-    """
-    txid = secrets.randbits(16)
-    name = f"{secrets.token_hex(6)}.{PROBE_DOMAIN}"
-    qname = b"".join(bytes([len(label)]) + label.encode() for label in name.split("."))
-    # Header: id, flags (recursion desired), 1 question; then name, type A, class IN.
-    query = struct.pack(">6H", txid, 0x0100, 1, 0, 0, 0)
-    query += qname + b"\0" + struct.pack(">2H", 1, 1)
+    def __init__(self, domain=PROBE_DOMAIN, timeout=PROBE_TIMEOUT):
+        self.domain = domain
+        self.timeout = timeout
 
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.settimeout(PROBE_TIMEOUT)
-            sock.connect((server, 53))  # also drops packets from other sources
-            sock.send(query)
-            reply = sock.recv(512)
-    except OSError:  # timeout, unreachable, refused...
-        return False
+    def probe(self, server):
+        """Resolve a random, uncached name via `server`.
 
-    if len(reply) < 12:
-        return False
-    reply_id, flags = struct.unpack(">2H", reply[:4])
-    is_response = bool(flags & 0x8000)
-    rcode = flags & 0x000F
-    return reply_id == txid and is_response and rcode in (0, 3)  # NOERROR, NXDOMAIN
+        True if it answers NOERROR or NXDOMAIN with the matching transaction
+        id. Timeouts, SERVFAIL and REFUSED all count as failure.
+        """
+        txid = secrets.randbits(16)
+        query = self._build_query(txid, f"{secrets.token_hex(6)}.{self.domain}")
+
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(self.timeout)
+                # Connecting also drops packets from other sources.
+                sock.connect((server, 53))
+                sock.send(query)
+                reply = sock.recv(512)
+        except OSError:
+            # Timeout, unreachable, refused...
+            return False
+
+        return self._is_valid_reply(reply, txid)
+
+    def _build_query(self, txid, name):
+        """Wire-format A query for `name`, recursion desired."""
+        labels = name.split(".")
+        qname = b"".join(bytes([len(label)]) + label.encode() for label in labels)
+
+        # Header: id, flags (recursion desired), 1 question; then name, type A,
+        # class IN.
+        header = struct.pack(">6H", txid, 0x0100, 1, 0, 0, 0)
+
+        return header + qname + b"\0" + struct.pack(">2H", 1, 1)
+
+    def _is_valid_reply(self, reply, txid):
+        """True for a response to `txid` with rcode NOERROR or NXDOMAIN."""
+        if len(reply) < 12:
+            return False
+
+        reply_id, flags = struct.unpack(">2H", reply[:4])
+        is_response = bool(flags & 0x8000)
+        rcode = flags & 0x000F
+
+        return (
+            reply_id == txid
+            and is_response
+            and rcode in (DNS_NOERROR, DNS_NXDOMAIN)
+        )
 
 
 def route_interface(ip):
@@ -174,35 +235,58 @@ def route_interface(ip):
     out = subprocess.run(
         ["route", "-n", "get", ip], capture_output=True, text=True
     ).stdout
+
     match = re.search(r"^\s*interface:\s*(\S+)", out, re.MULTILINE)
+
     return match.group(1) if match else None
 
 
 def load_config(path):
     """Read the JSON config and make sure the required keys are present."""
     with open(path) as f:
-        config = json.load(f)
+        raw = json.load(f)
+
     required = ("key", "secret", "instance", "interface")
-    missing = [k for k in required if not config.get(k)]
+    missing = [k for k in required if not raw.get(k)]
     if missing:
         raise ValueError(f"missing in {path}: {', '.join(missing)}")
-    config.setdefault("url", "https://127.0.0.1")
-    return config
+
+    known = {k: raw[k] for k in (*required, "url") if k in raw}
+
+    return Config(**known)
 
 
 class Failover:
-    def __init__(self, api, instance, iface, dry_run):
+    def __init__(self, api, dns, instance, iface, dry_run):
         self.api = api
-        self.instance = instance  # OPNsense instance name; scopes the peers
+        self.dns = dns
+
+        # OPNsense instance name; scopes the peers.
+        self.instance = instance
         self.iface = iface
         self.dry_run = dry_run
-        self.active = None  # Peer currently carrying traffic
-        self.failures = 0  # consecutive failed probes
-        self.last_ok = time.monotonic()  # last successful probe
-        self.healthy_since = None  # start of the current run of good probes
-        self.hold_until = 0.0  # no failover before this (backoff / WAN down)
-        self.switches = 0  # failovers since the last stable period
-        self.failed_at = {}  # uuid -> monotonic time we failed away from it
+
+        # Peer currently carrying traffic.
+        self.active = None
+
+        # Consecutive failed probes.
+        self.failures = 0
+
+        # Last successful probe.
+        self.last_ok = time.monotonic()
+
+        # Start of the current run of good probes.
+        self.healthy_since = None
+
+        # No failover before this (backoff / WAN down).
+        self.hold_until = 0.0
+
+        # Failovers since the last stable period.
+        self.switches = 0
+
+        # uuid -> monotonic time we failed away from it.
+        self.failed_at = {}
+
         self.last_sync = 0.0
 
     # ---- OPNsense state ---------------------------------------------------
@@ -217,17 +301,22 @@ class Failover:
     def list_peers(self):
         """Peers attached to our instance only."""
         uuid = self.instance_uuid()
+
         server = self.api.get(f"/api/wireguard/server/get_server/{uuid}")["server"]
         ours = {u for u, opt in server["peers"].items() if opt["selected"]}
+
         reply = self.api.read_post(
             "/api/wireguard/client/search_client", {"current": 1, "rowCount": -1}
         )
+
         if len(reply["rows"]) != reply["total"]:
             raise RuntimeError(f"got {len(reply['rows'])} of {reply['total']} peers")
+
         rows = [r for r in reply["rows"] if r["uuid"] in ours]
         peers = [Peer(r["uuid"], r["name"], str(r["enabled"]) == "1") for r in rows]
         if not peers:
             raise RuntimeError("no WireGuard peers configured")
+
         return peers
 
     def handshake_ages(self):
@@ -241,29 +330,40 @@ class Failover:
         for peer in sorted(peers, key=lambda p: p.uuid != new.uuid):
             if peer.enabled != (peer.uuid == new.uuid):
                 self.api.change(f"/api/wireguard/client/toggle_client/{peer.uuid}")
+
         result = self.api.change("/api/wireguard/service/reconfigure")
         if result is not None and result.get("result") != "ok":
             raise RuntimeError(f"WireGuard reconfigure failed: {result}")
+
         if not self.dry_run:
             enabled = {p.uuid for p in self.list_peers() if p.enabled}
             if enabled != {new.uuid}:
                 raise RuntimeError(f"expected only {new.name} enabled, got {enabled}")
 
+    def freshest(self, candidates):
+        """Candidate with the most recent handshake."""
+        ages = self.handshake_ages()
+
+        def age(peer):
+            value = ages.get(peer.name)
+            return NEVER if value is None else value
+
+        return min(candidates, key=age)
+
     def sync(self):
         """Find the active peer; if none or several are enabled, fix that."""
         self.last_sync = time.monotonic()
+
         peers = self.list_peers()
         enabled = [p for p in peers if p.enabled]
+
         if len(enabled) != 1:
-            ages = self.handshake_ages()
             # Several enabled: keep the freshest. None enabled: pick any.
-            keep = min(
-                enabled or peers,
-                key=lambda p: ages.get(p.name) if ages.get(p.name) is not None else 1e9,
-            )
+            keep = self.freshest(enabled or peers)
             log.warning("%d peers enabled, keeping %s", len(enabled), keep.name)
             self.set_active(keep, peers)
             enabled = [keep]
+
         if enabled[0] != self.active:
             log.info("active peer is %s", enabled[0].name)
         self.active = enabled[0]
@@ -285,20 +385,30 @@ class Failover:
         if self.active is None or now - self.last_sync >= SYNC_EVERY:
             self.sync()
 
-        if dns_probe(TUNNEL_DNS):
-            if self.failures:
-                log.info("probe recovered after %d failures", self.failures)
-            self.failures = 0
-            self.last_ok = now
-            if self.healthy_since is None:
-                self.healthy_since = now
-            elif now - self.healthy_since >= STABLE_AFTER:
-                self.switches = 0
-            log.debug("probe ok (%s)", self.active.name)
-            return
+        if self.dns.probe(TUNNEL_DNS):
+            self.record_success(now)
+        elif self.record_failure(now):
+            self.handle_dead_peer(now)
 
+    def record_success(self, now):
+        if self.failures:
+            log.info("probe recovered after %d failures", self.failures)
+
+        self.failures = 0
+        self.last_ok = now
+
+        if self.healthy_since is None:
+            self.healthy_since = now
+        elif now - self.healthy_since >= STABLE_AFTER:
+            self.switches = 0
+
+        log.debug("probe ok (%s)", self.active.name)
+
+    def record_failure(self, now):
+        """Count a failed probe. True if it is time to act on it."""
         self.failures += 1
         self.healthy_since = None
+
         silent_for = now - self.last_ok
         log.warning(
             "probe via %s failed (%d in a row, %.0fs since last success)",
@@ -306,18 +416,21 @@ class Failover:
             self.failures,
             silent_for,
         )
+
         too_early = self.failures < MIN_FAILURES or silent_for < FAIL_AFTER
-        if too_early or now < self.hold_until:
+
+        return not too_early and now >= self.hold_until
+
+    def handle_dead_peer(self, now):
+        if any(self.dns.probe(server) for server in DIRECT_DNS):
+            self.fail_over(now)
             return
 
-        if not any(dns_probe(server) for server in DIRECT_DNS):
-            log.warning("probe fails outside the tunnel too: WAN down, not switching")
-            self.failures = 0
-            self.last_ok = now  # give the peer a fresh window once WAN returns
-            self.hold_until = now + PROBE_INTERVAL * 3
-            return
-
-        self.fail_over(now)
+        log.warning("probe fails outside the tunnel too: WAN down, not switching")
+        self.failures = 0
+        # Give the peer a fresh window once WAN returns.
+        self.last_ok = now
+        self.hold_until = now + PROBE_INTERVAL * 3
 
     def pick_next(self, peers, now):
         """Random other peer with the same prefix, avoiding recent failures."""
@@ -326,22 +439,38 @@ class Failover:
             for p in peers
             if p.group == self.active.group and p.uuid != self.active.uuid
         ]
+
         fresh = [
             p
             for p in candidates
             if now - self.failed_at.get(p.uuid, float("-inf")) > RECENT_FAILURE
         ]
+
         return random.choice(fresh or candidates) if candidates else None
+
+    def log_handshake(self, peer):
+        """Context for the log: what did WireGuard itself think?"""
+        try:
+            age = self.handshake_ages().get(peer.name)
+        except (requests.RequestException, KeyError, ValueError) as err:
+            log.debug("could not read handshake age: %s", err)
+            return
+
+        when = f"{age}s ago" if age else "never"
+        log.info("%s: last handshake %s", peer.name, when)
+
+    def restart_unbound(self):
+        # The switch itself already happened, so a failure here is only logged.
+        try:
+            self.api.change("/api/unbound/service/restart")
+        except (RuntimeError, requests.RequestException) as err:
+            log.error("unbound restart failed: %s", err)
 
     def fail_over(self, now):
         old = self.active
         self.failed_at[old.uuid] = now
-        try:  # context for the log: what did WireGuard itself think?
-            age = self.handshake_ages().get(old.name)
-            when = f"{age}s ago" if age else "never"
-            log.info("%s: last handshake %s", old.name, when)
-        except (requests.RequestException, KeyError, ValueError) as err:
-            log.debug("could not read handshake age: %s", err)
+
+        self.log_handshake(old)
 
         peers = self.list_peers()
         new = self.pick_next(peers, now)
@@ -352,40 +481,48 @@ class Failover:
         else:
             log.warning("FAILING OVER %s -> %s", old.name, new.name)
             self.set_active(new, peers)
-        try:  # the switch itself already happened
-            self.api.change("/api/unbound/service/restart")
-        except (RuntimeError, requests.RequestException) as err:
-            log.error("unbound restart failed: %s", err)
+
+        self.restart_unbound()
 
         now = time.monotonic()
         self.switches += 1
         self.failures = 0
-        self.last_ok = now  # the new peer gets a full window to prove itself
+
+        # The new peer gets a full window to prove itself.
+        self.last_ok = now
+
         # 15s, 30s, 60s ... between failovers while nothing is healthy for long.
         self.hold_until = now + min(FAIL_AFTER * 2 ** (self.switches - 1), MAX_HOLD)
         self.sync()
 
     def run_forever(self):
         self.preflight()
+
         log.info(
             "watching %s via %s%s",
             self.iface,
             TUNNEL_DNS,
             " (dry-run)" if self.dry_run else "",
         )
+
         while True:
             started = time.monotonic()
+
             try:
                 self.step()
             except (RuntimeError, requests.RequestException) as err:
-                log.warning("%s", err)  # expected trouble: GUI busy, wg restarting
-            except Exception:  # a bug must not kill the watchdog
+                # Expected trouble: GUI busy, wg restarting.
+                log.warning("%s", err)
+            except Exception:
+                # A bug must not kill the watchdog.
                 log.exception("unexpected error")
+
             time.sleep(max(0.0, PROBE_INTERVAL - (time.monotonic() - started)))
 
 
-def main():
+def parse_args():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+
     parser.add_argument(
         "-c",
         "--config",
@@ -400,22 +537,36 @@ def main():
         default=0,
         help="-v: log every probe and API call; -vv: also HTTP details",
     )
-    args = parser.parse_args()
 
+    return parser.parse_args()
+
+
+def setup_logging(verbosity):
     logging.addLevelName(HTTP_TRACE, "HTTP")
+
     logging.basicConfig(
-        level=[logging.INFO, logging.DEBUG, HTTP_TRACE][min(args.verbose, 2)],
+        level=[logging.INFO, logging.DEBUG, HTTP_TRACE][min(verbosity, 2)],
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    if args.verbose >= 2:
+
+    if verbosity >= 2:
         logging.getLogger("urllib3").setLevel(logging.DEBUG)
+
+
+def main():
+    args = parse_args()
+    setup_logging(args.verbose)
+
     try:
-        config = load_config(args.config) 
+        config = load_config(args.config)
     except (OSError, ValueError) as err:
         sys.exit(f"cannot use {args.config}: {err}")
 
-    api = Api(config["url"], config["key"], config["secret"], args.dry_run)
-    failover = Failover(api, config["instance"], config["interface"], args.dry_run)
+    api = Api(config.url, config.key, config.secret, args.dry_run)
+    failover = Failover(
+        api, DnsClient(), config.instance, config.interface, args.dry_run
+    )
+
     try:
         failover.run_forever()
     except KeyboardInterrupt:
@@ -424,4 +575,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
