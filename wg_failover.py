@@ -172,7 +172,12 @@ class Api:
         )
 
         # At -vv this shows what OPNsense really said, e.g. the reason for a 500.
-        log.log(HTTP_TRACE, "HTTP %s: %s", response.status_code, response.text[:2000])
+        log.log(
+            HTTP_TRACE,
+            "HTTP %s: %s",
+            response.status_code,
+            response.text[:2000],
+        )
 
         if not response.ok:
             body = response.text.strip()[:300] or "empty body"
@@ -269,7 +274,12 @@ def load_config(path: str) -> Config:
 
 class Failover:
     def __init__(
-        self, api: Api, dns: DnsClient, instance: str, iface: str, dry_run: bool
+        self,
+        api: Api,
+        dns: DnsClient,
+        instance: str,
+        iface: str,
+        dry_run: bool,
     ) -> None:
         self.api = api
         self.dns = dns
@@ -319,7 +329,8 @@ class Failover:
         ours = {u for u, opt in server["peers"].items() if opt["selected"]}
 
         reply = self.api.read_post(
-            "/api/wireguard/client/search_client", {"current": 1, "rowCount": -1}
+            "/api/wireguard/client/search_client",
+            {"current": 1, "rowCount": -1},
         )
 
         if len(reply["rows"]) != reply["total"]:
@@ -451,9 +462,7 @@ class Failover:
         self.last_ok = now
         self.hold_until = now + PROBE_INTERVAL * 3
 
-    def pick_next(
-        self, active: Peer, peers: Iterable[Peer], now: float
-    ) -> Peer | None:
+    def pick_next(self, active: Peer, peers: Iterable[Peer], now: float) -> Peer | None:
         """Random other peer with the same prefix, avoiding recent failures."""
         candidates = [
             p for p in peers if p.group == active.group and p.uuid != active.uuid
@@ -514,9 +523,7 @@ class Failover:
             self.last_ok = now
 
             # 15s, 30s, 60s ... between failovers while nothing is healthy for long.
-            self.hold_until = now + min(
-                FAIL_AFTER * 2 ** (self.switches - 1), MAX_HOLD
-            )
+            self.hold_until = now + min(FAIL_AFTER * 2 ** (self.switches - 1), MAX_HOLD)
             self.active = None
 
         self.sync()
