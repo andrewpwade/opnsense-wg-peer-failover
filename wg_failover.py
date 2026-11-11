@@ -411,7 +411,7 @@ def main():
         logging.getLogger("urllib3").setLevel(logging.DEBUG)
     try:
         config = load_config(args.config) 
-   except (OSError, ValueError) as err:
+    except (OSError, ValueError) as err:
         sys.exit(f"cannot use {args.config}: {err}")
 
     api = Api(config["url"], config["key"], config["secret"], args.dry_run)
