@@ -108,6 +108,9 @@ SYNC_EVERY = 30
 # Reconfigure / unbound restart can take a few seconds.
 API_TIMEOUT = 30
 
+# What a failed or malformed API reply can raise (RuntimeError: non-2xx status).
+API_ERRORS = (requests.RequestException, RuntimeError, KeyError, ValueError)
+
 # Sort key for peers that have never completed a handshake.
 NEVER = 1e9
 
@@ -248,12 +251,18 @@ def load_config(path: str) -> Config:
     with open(path) as f:
         raw = json.load(f)
 
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+
     required = ("key", "secret", "instance", "interface")
     missing = [k for k in required if not raw.get(k)]
     if missing:
         raise ValueError(f"missing in {path}: {', '.join(missing)}")
 
     known = {k: raw[k] for k in (*required, "url") if k in raw}
+    wrong = [k for k, v in known.items() if not isinstance(v, str)]
+    if wrong:
+        raise ValueError(f"not strings in {path}: {', '.join(wrong)}")
 
     return Config(**known)
 
@@ -346,7 +355,11 @@ class Failover:
 
     def freshest(self, candidates: Sequence[Peer]) -> Peer:
         """Candidate with the most recent handshake."""
-        ages = self.handshake_ages()
+        try:
+            ages = self.handshake_ages()
+        except API_ERRORS as err:
+            log.warning("could not read handshake ages, choosing arbitrarily: %s", err)
+            ages = {}
 
         def age(peer: Peer) -> float:
             value = ages.get(peer.name)
@@ -458,11 +471,12 @@ class Failover:
         """Context for the log: what did WireGuard itself think?"""
         try:
             age = self.handshake_ages().get(peer.name)
-        except (requests.RequestException, KeyError, ValueError) as err:
+        except API_ERRORS as err:
+            # Informational only: must never stand in the way of a failover.
             log.debug("could not read handshake age: %s", err)
             return
 
-        when = f"{age}s ago" if age else "never"
+        when = "never" if age is None else f"{age}s ago"
         log.info("%s: last handshake %s", peer.name, when)
 
     def restart_unbound(self) -> None:
@@ -477,27 +491,34 @@ class Failover:
 
         self.log_handshake(old)
 
-        peers = self.list_peers()
-        new = self.pick_next(old, peers, now)
-        if new is None:
-            # Nothing to switch to, but bouncing the tunnel sometimes fixes it.
-            log.warning("no other '%s-' peer: restarting WireGuard", old.group)
-            self.api.change("/api/wireguard/service/restart")
-        else:
-            log.warning("FAILING OVER %s -> %s", old.name, new.name)
-            self.set_active(new, peers)
+        try:
+            peers = self.list_peers()
+            new = self.pick_next(old, peers, now)
+            if new is None:
+                # Nothing to switch to, but bouncing the tunnel sometimes fixes it.
+                log.warning("no other '%s-' peer: restarting WireGuard", old.group)
+                self.api.change("/api/wireguard/service/restart")
+            else:
+                log.warning("FAILING OVER %s -> %s", old.name, new.name)
+                self.set_active(new, peers)
 
-        self.restart_unbound()
+            self.restart_unbound()
+        finally:
+            # Also on a half-finished switch: back off rather than retrying every
+            # probe, and forget the active peer so the next step re-syncs.
+            now = time.monotonic()
+            self.switches += 1
+            self.failures = 0
 
-        now = time.monotonic()
-        self.switches += 1
-        self.failures = 0
+            # The new peer gets a full window to prove itself.
+            self.last_ok = now
 
-        # The new peer gets a full window to prove itself.
-        self.last_ok = now
+            # 15s, 30s, 60s ... between failovers while nothing is healthy for long.
+            self.hold_until = now + min(
+                FAIL_AFTER * 2 ** (self.switches - 1), MAX_HOLD
+            )
+            self.active = None
 
-        # 15s, 30s, 60s ... between failovers while nothing is healthy for long.
-        self.hold_until = now + min(FAIL_AFTER * 2 ** (self.switches - 1), MAX_HOLD)
         self.sync()
 
     def run_forever(self) -> NoReturn:
